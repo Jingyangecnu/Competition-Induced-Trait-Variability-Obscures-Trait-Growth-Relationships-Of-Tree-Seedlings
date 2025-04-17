@@ -1,0 +1,1482 @@
+---
+title: "Competition-induced greater trait variability obscures the trait-growth relationship"
+author:
+  - 杨菁
+date: '`r format(Sys.Date())`'
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+---
+
+
+<style type='text/css'>
+
+body{ /* Normal  */
+      font-size: 16px;
+      font-family: 'Times New Roman'
+  }
+td {  /* Table  */
+  font-size: 14px;
+}
+h1.title {
+  font-size: 34px;
+  color: Black;
+  font-family: 'Arial';
+}
+h1 { /* Header 1 */
+  font-size: 26px;
+  color: DarkBlue;
+  font-family: 'Arial';
+}
+h2 { /* Header 2 */
+    font-size: 22px;
+    font-family: 'Arial';
+    color: DarkBlue;
+}
+h3 { /* Header 3 */
+  font-size: 18px;
+  font-family: 'Arial';
+  color: DarkBlue;
+}
+
+h4 { /* Header 4 */
+  font-size: 16px;
+  font-family: 'Arial';
+  color: DarkBlue;
+}
+code.r{ /* Code block */
+    font-size: 12px;
+}
+pre { /* Code block - determines code spacing between lines */
+    font-size: 12px;
+}
+</style>
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  tidy = TRUE)
+
+# Load required libraries
+required_libraries <- c(
+  "ggplot2", "patchwork", "knitr", "kableExtra",
+  "hypervolume", "snow", "parallel", "ggsignif",
+  "alphahull", "RColorBrewer", "formatR", "gridExtra",
+  "ggpubr", "fmsb", "tidyr", "ggsci", "TPD", "ggridges",
+  "reshape2", "glmm.hp", "lmerTest", "ape", "nlme", "MuMIn", "glmmTMB",
+  "performance", "sjPlot", "tibble", "effectsize", "cowplot", "sjPlot", "lmerTest",
+  "ggcorrplot", "lmerTest", "dplyr", "funspace", "purrr", "ggExtra", "officer", "ggpmisc", "eoffice"
+)
+
+invisible(suppressPackageStartupMessages(lapply(required_libraries, library, character.only = TRUE)))
+source("visualization_corefun.R")
+# Source custom functions and set font family
+my_family <- "sans"
+
+# Create output directories
+output_dirs <- c("02_output_results", "02_output_results/analysis_results", "02_output_results/figs", "02_output_results/tables")
+invisible(sapply(output_dirs, function(dir) dir.create(dir, showWarnings = FALSE)))
+
+# # Set output directory names
+dir_name <- "02_output_results/analysis_results"
+f_dir_name <- "02_output_results/figs"
+t_dir_name <- "02_output_results/tables"
+
+# Traits
+above_traits <- c("LA", "SLA", "LMA", "LDMC", "LTO", "SSD")
+fineroot_traits <- c("SRL", "RD", "RTD", "SRA")
+trait.names <- c(above_traits, fineroot_traits)
+# Write selected traits to a text file
+writeLines(trait.names, file.path(dir_name, "trait_name.txt"))
+```
+
+## Core function
+```{r}
+# c("#304D30", "#4F6F52", "#739072", "#86A789", "#D2E3C8", "#B6C4B6", "#DFD0B8", "#DEAA79", "#AF8F6F", "#6F4E37")
+calc_annual_trait_RGR <- function(data, trait, RGR = "RGR") {
+  result <- data.frame()
+  for (compete in unique(data$Compete)) {
+    for (year in unique(data$comp_year)) {
+      subset_data <- data %>%
+        filter(Compete == !!compete, comp_year == !!year) %>%
+        select(Nenv, sp, ring.num, Compete, growth_time, Light, Moisture, AP, trait, RGR, paste0(trait, "_minmax_scaled")) %>%
+        na.omit()
+
+      if (nrow(subset_data) > 5) {
+        # Fit the mixed-effects model
+        model_formula <- as.formula(paste0(RGR, " ~ ", trait, " *(Light + Moisture + AP) + (1 | sp) + (1|Nenv)"))
+        model <- lmer(model_formula, data = subset_data)
+        # Extract slope (first fixed effect coefficient)
+        slope <- fixef(model)[2]
+        TLslope <- fixef(model)[6]
+        TMslope <- fixef(model)[7]
+        TPslope <- fixef(model)[8]
+
+        # Calculate marginal R² using `MuMIn` package for lmer models
+        library(MuMIn)
+        r2m <- r.squaredGLMM(model)[, "R2m"]
+        r2c <- r.squaredGLMM(model)[, "R2c"]
+
+        sp_slopes <- c() # Initialize a vector to store slopes for each species
+        # Iterate through each species
+        for (species in unique(subset_data$sp)) {
+          # Subset data for the current species
+          species_data <- subset_data %>%
+            filter(sp == species) %>%
+            na.omit()
+          # Ensure there is enough data to fit the model
+          if (nrow(species_data) > 5) {
+            # Define the model formula dynamically for the given trait and RGR
+            model_formula <- as.formula(paste0(RGR, " ~ ", trait))
+            # Fit the linear mixed-effects model for the current species
+            sp_model <- summary(lm(model_formula, data = species_data))
+            # Extract the slope for the trait (first fixed-effect coefficient)
+            sp_slope <- sp_model$coefficients[2, 1]
+            # Append the slope to the slopes vector
+            sp_slopes <- c(sp_slopes, sp_slope)
+          }
+        }
+
+        # Calculate the mean and standard deviation of slopes
+        normalized_slopes <- (sp_slopes - min(sp_slopes)) / (max(sp_slopes) - min(sp_slopes))
+        mean_slope <- mean(normalized_slopes, na.rm = TRUE)
+        sd_slope <- sd(normalized_slopes, na.rm = TRUE)
+        # Calculate the coefficient of variation (CV) of slopes
+        cv_slope <- sd_slope / mean_slope
+        # Extract p-value for the main effect of the trait
+        p_value <- summary(model)$coefficients[2, "Pr(>|t|)"]
+
+        com_itv <- CV4(subset_data[, paste0(trait, "_minmax_scaled")])
+        #sp_itv <- mean(tapply(subset_data[, paste0(trait, "_minmax_scaled")], list(subset_data$sp), CV4), na.rm = T)
+
+        subset_data$new_com <- "Com"
+        kernel.trait <- TPDs(traits = subset_data[, trait], species = subset_data$new_com) # Kernel density estimates of trait for individuals
+        functional.indices.trait <- REND(TPDs = kernel.trait)
+        
+        sp.kernel.trait <- TPDs(traits = subset_data[, trait], species = subset_data$sp) # Kernel density estimates of trait for individuals
+        sp.fun.indices <- REND(TPDs = sp.kernel.trait)
+        sp_itv <- mean(sp.fun.indices$species$FRichness)
+        ol <- dissim(sp.kernel.trait)
+        dis <- ol$populations$dissimilarity
+        inter_dis <- mean(dis[upper.tri(dis) | lower.tri(dis)])
+        
+
+        mean_trait <- mean(subset_data[, paste0(trait, "_minmax_scaled")], na.rm = T)
+        sp_meantrait <- tapply(subset_data[, paste0(trait, "_minmax_scaled")], list(subset_data$sp), mean, na.rm = T)
+        #inter_dis <- CV4(sp_meantrait)
+
+        RGR_var <- sd(subset_data$RGR, na.rm = T)
+        RGR_mean <- mean(subset_data$RGR, na.rm = T)
+
+
+        result <- rbind(result, data.frame(
+          Compete = compete,
+          sample_size = nrow(subset_data),
+          trait = trait,
+          comp_year = year,
+          estimate = slope,
+          TLestimate = TLslope,
+          TMestimate = TMslope,
+          TPestimate = TPslope,
+          TYestimate = NA,
+          Marginal_R2 = r2m,
+          Conditional_R2 = r2c,
+          p_value = p_value,
+          com_ITV = com_itv,
+          sp_ITV = sp_itv,
+          Fric = functional.indices.trait$species$FRichness,
+          Fdiv = functional.indices.trait$species$FDivergence,
+          mean_trait = mean_trait,
+          inter_dis = inter_dis,
+          RGR_var = RGR_var,
+          RGR_mean = RGR_mean,
+          sp_slope_cv = cv_slope
+        ))
+      }
+    }
+  }
+  return(result)
+}
+
+calc_trait_RGR <- function(data, trait, RGR = "RGR") {
+  result <- data.frame()
+  for (compete in unique(data$Compete)) {
+    subset_data <- data %>%
+      filter(Compete == !!compete) %>%
+      select(Nenv, sp, Compete, growth_time, Light, Moisture, AP, trait, RGR, paste0(trait, "_minmax_scaled")) %>%
+      na.omit()
+    
+    subset_data$growth_time <- scale(as.numeric(subset_data$growth_time))
+
+    if (nrow(subset_data) > 2) {
+      # Fit the mixed-effects model
+      model_formula <- as.formula(paste0(RGR, " ~ ", trait, " *(Light + Moisture + AP + growth_time) + (1 | sp) +(1|Nenv)"))
+      model <- lmer(model_formula, data = subset_data)
+      # Extract slope (first fixed effect coefficient)
+      slope <- fixef(model)[2]
+      TLslope <- fixef(model)[7]
+      TMslope <- fixef(model)[8]
+      TPslope <- fixef(model)[9]
+      TYslope <- fixef(model)[9]
+
+      # Calculate marginal R² using `MuMIn` package for lmer models
+      library(MuMIn)
+      r2m <- r.squaredGLMM(model)[, "R2m"]
+      r2c <- r.squaredGLMM(model)[, "R2c"]
+
+      sp_slopes <- c() # Initialize a vector to store slopes for each species
+      # Iterate through each species
+      for (species in unique(subset_data$sp)) {
+        # Subset data for the current species
+        species_data <- subset_data %>%
+          filter(sp == species) %>%
+          na.omit()
+        # Ensure there is enough data to fit the model
+        if (nrow(species_data) > 5) {
+          # Define the model formula dynamically for the given trait and RGR
+          model_formula <- as.formula(paste0(RGR, " ~ ", trait))
+          # Fit the linear mixed-effects model for the current species
+          sp_model <- summary(lm(model_formula, data = species_data))
+          # Extract the slope for the trait (first fixed-effect coefficient)
+          sp_slope <- sp_model$coefficients[2, 1]
+          # Append the slope to the slopes vector
+          sp_slopes <- c(sp_slopes, sp_slope)
+        }
+      }
+
+      # Calculate the mean and standard deviation of slopes
+      normalized_slopes <- (sp_slopes - min(sp_slopes)) / (max(sp_slopes) - min(sp_slopes))
+      mean_slope <- mean(normalized_slopes, na.rm = TRUE)
+      sd_slope <- sd(normalized_slopes, na.rm = TRUE)
+      # Calculate the coefficient of variation (CV) of slopes
+      cv_slope <- sd_slope / mean_slope
+      # Extract p-value for the main effect of the trait
+      p_value <- summary(model)$coefficients[2, "Pr(>|t|)"]
+
+      com_itv <- CV4(subset_data[, paste0(trait, "_minmax_scaled")])
+      #sp_itv <- mean(tapply(subset_data[, paste0(trait, "_minmax_scaled")], list(subset_data$sp), CV4), na.rm = T)
+      subset_data$new_com <- "Com"
+      kernel.trait <- TPDs(traits = subset_data[, trait], species = subset_data$new_com) # Kernel density estimates of trait for individuals
+      functional.indices.trait <- REND(TPDs = kernel.trait)
+      
+      sp.kernel.trait <- TPDs(traits = subset_data[, trait], species = subset_data$sp)
+      sp.fun.indices <- REND(TPDs = sp.kernel.trait)
+      sp_itv <- mean(sp.fun.indices$species$FRichness)
+      ol <- dissim(sp.kernel.trait)
+      dis <- ol$populations$dissimilarity
+      inter_dis <- mean(dis[upper.tri(dis) | lower.tri(dis)])
+        
+      mean_trait <- mean(subset_data[, paste0(trait, "_minmax_scaled")], na.rm = T)
+      sp_meantrait <- tapply(subset_data[, paste0(trait, "_minmax_scaled")], list(subset_data$sp), mean, na.rm = T)
+      #inter_dis <- CV4(sp_meantrait)
+      RGR_var <- sd(subset_data$RGR, na.rm = T)
+      RGR_mean <- mean(subset_data$RGR, na.rm = T)
+
+
+      result <- rbind(result, data.frame(
+        Compete = compete,
+        sample_size = nrow(subset_data),
+        trait = trait,
+        comp_year = "All",
+        estimate = slope,
+        TLestimate = TLslope,
+        TMestimate = TMslope,
+        TPestimate = TPslope,
+        TYestimate = TYslope,
+        Marginal_R2 = r2m,
+        Conditional_R2 = r2c,
+        p_value = p_value,
+        com_ITV = com_itv,
+        sp_ITV = sp_itv,
+        Fric = functional.indices.trait$species$FRichness,
+        Fdiv = functional.indices.trait$species$FDivergence,
+        mean_trait = mean_trait,
+        inter_dis = inter_dis,
+        RGR_var = RGR_var,
+        RGR_mean = RGR_mean,
+        sp_slope_cv = cv_slope
+      ))
+    }
+  }
+  return(result)
+}
+
+# Core function
+CV4 <- function(trait_sample) {
+  trait_sample <- trait_sample[!is.na(trait_sample)]
+  if (length(trait_sample) > 1) {
+    N <- length(trait_sample)
+    # calcualte CV^2
+    y_bar <- mean(trait_sample)
+    s2_hat <- var(trait_sample)
+    cv_2 <- s2_hat / y_bar^2
+    cv_1 <- sqrt(cv_2)
+    gamma_1 <- sum(((trait_sample - y_bar) / s2_hat^0.5)^3) / N
+    gamma_2 <- sum(((trait_sample - y_bar) / s2_hat^0.5)^4) / N
+    bias2 <- cv_1^3 / N - cv_1 / 4 / N - cv_1^2 * gamma_1 / 2 / N - cv_1 * gamma_2 / 8 / N
+    cv4 <- cv_1 - bias2
+  } else {
+    cv4 <- NA
+  }
+  return(cv4)
+}
+
+
+Comp_PCA <- function(alltraits_standard_tda, pr, trait.names, p.title, x.lim, y.lim, point_shape) {
+  # Point data for PCA plot
+  point.pca <- alltraits_standard_tda[, c("Nenv", "sp", "growth_time", "Compete", "PC1", "PC2")]
+
+  # Axis data for PCA plot
+  x <- "V1"
+  y <- "V2"
+  par.all.loading <- data.frame(Trait = trait.names, as.data.frame(matrix(pr$loadings, nrow = length(trait.names))))
+  axis.pca <- transform(par.all.loading, v1 = 5 * (get(x)), v2 = 5 * (get(y)))
+  axis.pca <- data.frame(axis.pca)
+
+  # Calculate explained variance for PC1 and PC2
+  pc1_explained <- round(100 * pr$sd[1]^2 / sum(pr$sd^2), 1)
+  pc2_explained <- round(100 * pr$sd[2]^2 / sum(pr$sd^2), 1)
+
+  # Create the PCA plot
+  point.pca1 <- point.pca
+  point.pca1$cg <- paste0(point.pca1$Compete, point.pca1$growth_time)
+  point.pca1$cg <- factor(point.pca1$cg, levels = c("alone360", "alone720", "alone1080", "inter360", "inter720", "inter1080"))
+  point.pca1$spg <- paste0(point.pca1$sp, point.pca1$growth_time)
+  point.pca1$spg <- factor(point.pca1$spg, levels = c(unique(point.pca1$spg)))
+  # point.pca1$compete <- factor(point.pca1$Compete, levels = c("alone", "inter"))
+
+  ## 绘图
+  p <- ggplot(point.pca1, aes(x = PC1, y = PC2)) +
+    scale_shape_manual(values = point_shape) +
+    geom_point(aes(color = sp, shape = Compete), size = 1.5, alpha = 0.7) +
+    # stat_ellipse(aes(group=sp,color = sp),fill=NA,geom="polygon" ,type="norm",alpha=0.2,level = 0.95,show.legend = T,size=1)+
+    ggtitle(p.title) +
+    xlab(paste0("PC1 (", pc1_explained, "%)")) +
+    ylab(paste0("PC2 (", pc2_explained, "%)")) +
+    geom_segment(
+      data = axis.pca, aes(x = 0, y = 0, xend = v1, yend = v2),
+      arrow = arrow(length = unit(0.2, "cm")), alpha = 0.75, color = "black", linetype = 2
+    ) +
+    geom_text(
+      data = axis.pca, aes(v1 + 0.1, v2 + 0.1, label = Trait), size = 4,
+      nudge_x = +0.2, nudge_y = +0.3
+    ) +
+    theme(legend.text = element_text(face = "italic"), legend.position = "none") +
+    theme_Publication() +
+    scale_colour_Publication() +
+    scale_fill_Publication() +
+    xlim(x.lim) +
+    ylim(y.lim)
+
+  # Return the PCA plot
+  return(p)
+}
+```
+
+## Data pre-processing
+
+The initial dataset comprised 5188 seedling records, including 1077 dead seedlings. To ensure data quality, individuals with unrealistic growth values were removed. Specifically, seedlings with negative growth due to stem breakage or other causes, as well as those with growth rates exceeding four times the standard deviation, were excluded, resulting in the removal of 41 individuals. After this initial filtering, 4070 seedlings with valid relative growth rate (RGR) data remained.
+
+However, during trait measurement, some seedlings lacked leaf or fine root trait data. To maintain consistency across datasets, these seedlings (a total of 740 individuals) were further excluded. Consequently, the final dataset consisted of 3330 individuals with complete functional trait and growth data. This dataset included 1952 seedlings harvested in the second year and 1378 seedlings harvested in the third year.
+```{r}
+# Load processed growth data
+load("01_data/processed_data/trait_growth_data.Rdata")
+
+# Filter data for the 2nd and 3rd comp_years and rename RGR column
+tda <- tda[tda$comp_year %in% c("2nd", "3rd"), ] %>%
+  rename(RGR = RGR_H_mean) # 5188 # uses the annual average height growth rate (RGR) as an 
+
+tda[tda$comp_year=="2nd","final_height"]<- tda[tda$comp_year=="2nd","Height3"]
+tda[tda$comp_year=="3rd","final_height"]<- tda[tda$comp_year=="3rd","Height4"]
+
+# Count individuals with memo "S" and remove them
+nrow(tda[tda$memo == "S", ]) # 1077
+tda <- subset(tda, memo != "S") # 4111
+
+#indicator of plant growth
+tda_2nd_1 <- tda[tda$comp_year=="3rd"&tda$RGR<=0,]
+tda_2nd_2 <- tda[tda$comp_year=="3rd"&tda$RGR_H_1yr<=0,]
+table(tda_2nd_1$Compete)
+table(tda_2nd_2$Compete)
+tda_3rd <- tda[tda$comp_year=="3rd"&tda$RGR<=0,]
+
+table(tda_3rd$Compete)
+# Replace negative growth values with NA and count replacements
+sum(sapply(tda["RGR"], function(col) sum(col <= 0, na.rm = TRUE))) # 26
+tda["RGR"] <- lapply(tda["RGR"], function(col) ifelse(col <= 0, NA, col))
+
+# Calculate mean and standard deviation for RGR
+mean_rgr <- mean(tda$RGR, na.rm = TRUE)
+sd_rgr <- sd(tda$RGR, na.rm = TRUE)
+# Identify and count outliers beyond mean ± 4 * SD
+sum(tda$RGR > (mean_rgr + 4 * sd_rgr) | tda$RGR < (mean_rgr - 4 * sd_rgr), na.rm = TRUE)
+# Set outlier values to NA
+tda$RGR <- ifelse(tda$RGR > (mean_rgr + 4 * sd_rgr) | tda$RGR < (mean_rgr - 4 * sd_rgr), NA, tda$RGR)
+# Remove individuals with NA RGR or RGR <= 0
+tda <- tda[!is.na(tda$RGR) & tda$RGR > 0, ]
+
+
+# Extract individuals with all valid traits (non-missing and non-zero values)
+tda[trait.names] <- lapply(tda[trait.names], as.numeric) # Convert trait names to numeric
+indtraits_tda <- tda %>%
+  # Select columns
+  select(sp, sp_abbr, Nenv, ring.num, Light, Moisture, AP, Compete, growth_time,final_height, comp_year, BM, RGR, all_of(trait.names)) %>%
+  mutate(across(
+    all_of(trait.names[!trait.names %in% c("LTO", "LDMC")]),
+    ~ scale(log10(.))
+  )) %>%
+  mutate(across(
+    all_of(c("LTO", "LDMC")), # "RD" is more normal
+    ~ scale((.))
+  )) %>%
+  mutate(across(all_of(trait.names),
+    ~ (. - min(., na.rm = TRUE)) / (max(., na.rm = TRUE) - min(., na.rm = TRUE)),
+    .names = "{.col}_minmax_scaled"
+  )) %>%
+  na.omit() ## 3330
+
+indtraits_tda$RGR <- scale(indtraits_tda$RGR)
+
+
+# Replace outliers in SLA and LMA with NA
+indtraits_tda$SLA[indtraits_tda$SLA < -4] <- NA
+indtraits_tda$LMA[indtraits_tda$LMA > 4] <- NA
+indtraits_tda$RD[indtraits_tda$RD < -5] <- NA
+
+# Calculate effective sample sizes (non-NA and non-zero values) grouped by year and competition treatment
+effective_sample_sizes <- indtraits_tda %>%
+  group_by(comp_year, Compete) %>%
+  summarise(across(
+    all_of(trait.names),
+    ~ sum(!is.na(.) & . != 0),
+    .names = "{.col}"
+  )) %>%
+  pivot_longer(
+    cols = -c(comp_year, Compete),
+    names_to = "Trait",
+    values_to = "Sample_Size"
+  ) %>%
+  unite("Time_Compete", comp_year, Compete, sep = "_") %>%
+  pivot_wider(
+    names_from = Time_Compete,
+    values_from = Sample_Size
+  )
+kable(effective_sample_sizes)
+write.csv(effective_sample_sizes, file = "02_output_results/effective_sample_sizes.csv")
+
+
+cor.test(indtraits_tda$BM,indtraits_tda$final_height)
+cor.test(indtraits_tda[indtraits_tda$comp_year=="2nd",]$BM,
+         indtraits_tda[indtraits_tda$comp_year=="2nd",]$final_height)
+cor.test(indtraits_tda[indtraits_tda$comp_year=="3rd",]$BM,
+         indtraits_tda[indtraits_tda$comp_year=="3rd",]$final_height)
+
+# 加载必要的包
+library(ggplot2)
+
+# 执行相关性检验
+cor_test <- cor.test(indtraits_tda$BM, indtraits_tda$final_height)
+
+# 提取 R 和 P 值
+r_value <- cor_test$estimate
+p_value <- cor_test$p.value
+r_squared <- r_value^2
+
+# 绘制回归图
+indtraits_tda$sp_abbr <- factor(indtraits_tda$sp_abbr, levels = sp_abbr)
+figBM_H <- ggplot(indtraits_tda, aes(x = BM,col=sp_abbr, y = final_height)) +
+  geom_point( alpha = 0.6) +  # 绘制散点图
+  geom_smooth(aes(group=sp_abbr),method = "lm", se = TRUE) +  # 添加线性回归线，显示置信区间
+  labs(title = "",
+       x = "Total biomass",
+       y = "Height") +
+  theme_Publication() +
+scale_colour_Publication()+
+  stat_poly_eq(
+    method = "lm",
+    aes(label = paste(after_stat(rr.label),
+      after_stat(p.value.label),
+      sep = "*\", \"*"
+    )), size = 3
+  ) + facet_grid(.~comp_year) + 
+  theme_Publication(base_size = 14)+
+  theme(legend.title = element_blank())
+
+# 显示图形
+figBM_H
+ggsave(figBM_H,file="02_output_results/figs/Fig.2_all_R2_slope.pdf", height = 5, width = 8)
+```
+
+## Single-trait growth models
+```{r}
+all_indTrait_RGR_results <- data.frame()
+for (trait in trait.names) {
+  trait_result <- calc_trait_RGR(indtraits_tda, trait, "RGR")
+  all_indTrait_RGR_results <- rbind(all_indTrait_RGR_results, trait_result)
+}
+
+indTrait_RGR_results <- data.frame()
+for (trait in trait.names) {
+  trait_annual_result <- calc_annual_trait_RGR(indtraits_tda, trait, "RGR")
+  indTrait_RGR_results <- rbind(indTrait_RGR_results, trait_annual_result)
+}
+
+indTrait_RGR_results$comp_year <- factor(indTrait_RGR_results$comp_year, levels = c("2nd", "3rd"))
+indTrait_RGR_results$trait <- factor(indTrait_RGR_results$trait, levels = trait.names)
+
+all_indTrait_RGR_results$comp_year <- factor(all_indTrait_RGR_results$comp_year, levels = c("All"))
+all_indTrait_RGR_results$trait <- factor(all_indTrait_RGR_results$trait, levels = trait.names)
+
+tapply(abs(all_indTrait_RGR_results$estimate),list(all_indTrait_RGR_results$Compete),mean)
+```
+
+## Figure 2 R2 and slope of growth models
+```{r,fig.height=10,fig.width=8}
+all_indTrait_RGR_results
+a=tapply(all_indTrait_RGR_results$Marginal_R2,list(all_indTrait_RGR_results$Compete),mean)
+
+alone.df <- all_indTrait_RGR_results[all_indTrait_RGR_results$Compete=="alone",]
+inter.df <- all_indTrait_RGR_results[all_indTrait_RGR_results$Compete=="inter",]
+inter.df$Fric_change <- inter.df$Fric-alone.df$Fric
+mean(inter.df$Fric_change)/mean(alone.df$Fric)
+shapiro.test(inter.df$Fric_change)
+mean(inter.df$Fric)
+t.test(inter.df$Fric_change)
+wilcox.test(inter.df$Fric_change)
+
+inter.df$sp_ITV_change <- inter.df$sp_ITV-alone.df$sp_ITV
+mean(inter.df$sp_ITV_change)/mean(alone.df$sp_ITV)
+mean(inter.df$sp_ITV)
+shapiro.test(inter.df$sp_ITV_change)
+t.test(inter.df$sp_ITV_change)
+wilcox.test(inter.df$sp_ITV_change)
+
+inter.df$r2_change <- inter.df$Marginal_R2-alone.df$Marginal_R2
+inter.df$r2_rechange <- (inter.df$Marginal_R2-alone.df$Marginal_R2)/alone.df$Marginal_R2
+inter.df$alone_r2 <- alone.df$Marginal_R2
+inter.df$alone_slope <- alone.df$estimate
+
+inter.df$slope_change <- abs(inter.df$estimate)-abs(alone.df$estimate)
+inter.df$slope_rechange <- (inter.df$slope_change/abs(alone.df$estimate))*100
+
+inter.df$alone_TLslope <- alone.df$TLestimate
+inter.df$TLslope_change <- abs(inter.df$TLestimate)-abs(alone.df$TLestimate)
+inter.df$TLslope_rechange <- (inter.df$TLslope_change/abs(alone.df$TLestimate))*100
+
+inter.df <- inter.df[,c("trait","Marginal_R2","estimate","alone_r2",
+                        "alone_slope","r2_change","r2_rechange",
+                        "slope_change","slope_rechange")]
+
+wilcox.test(alone.df$Marginal_R2, inter.df$Marginal_R2,paired = T)
+t.test(abs(alone.df$estimate), abs(inter.df$estimate),paired = T)
+wilcox.test(abs(alone.df$estimate), abs(inter.df$estimate),paired = T)
+
+shapiro.test(abs(alone.df$Marginal_R2))
+shapiro.test(abs(inter.df$Marginal_R2))
+shapiro.test(abs(alone.df$Marginal_R2) - abs(inter.df$Marginal_R2))
+
+shapiro.test(abs(alone.df$estimate))
+shapiro.test(abs(inter.df$estimate))
+shapiro.test(abs(alone.df$estimate) - abs(inter.df$estimate))
+
+(a[2]-a[1])/a[1]
+tapply(all_indTrait_RGR_results$Marginal_R2,list(all_indTrait_RGR_results$Compete),se)
+
+tapply(indtraits_tda$RGR,list(indtraits_tda$Compete),mean)
+alone.tda <- indtraits_tda[indtraits_tda$Compete=="alone",]
+inter.tda <- indtraits_tda[indtraits_tda$Compete=="inter",]
+wilcox.test(alone.tda$RGR,inter.tda$RGR)
+### Compare competition-free and competition
+### Marginal R2
+create_ind_trait_plot <- function(indTrait_RGR_results, y, ylab, xlab, title) {
+  library(ggplot2)
+  library(ggpubr) # For stat_compare_means
+  library(patchwork) # If you are using patchwork for layout
+  library(ggthemes) # For theme_Publication
+
+  ggplot(indTrait_RGR_results, aes(x = Compete, y = !!sym(y), group = Compete)) +
+    geom_boxplot(position = position_dodge(width = 0.6), aes(group = Compete, linetype = Compete), width = 0.6, alpha = 1, size = 0.7) +
+    geom_jitter(position = position_dodge(width = 0.6), aes(col = trait, group = Compete, shape = Compete), alpha = 0.3, size = 2.5) +
+    geom_line(aes(group = trait, color = trait), size = 0.8, alpha = 0.3) +
+    scale_fill_manual(values = c("#cc340c", "#e8490f", "#f18800", "#e4ce00", "#9ec417", "#13a983", "#44c1f0", "#3f60aa", "#739072", "#6F4E37")) +
+    scale_color_manual(values = c("#cc340c", "#e8490f", "#f18800", "#e4ce00", "#9ec417", "#13a983", "#44c1f0", "#3f60aa", "#739072", "#6F4E37")) +
+    scale_shape_manual(values = c(1, 19), labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+    scale_x_discrete(labels = c("alone" = "Competition-free", "inter" = "Competition")) + # 修改 x 轴标签
+    stat_compare_means(
+      method = "t.test", paired = TRUE, comparisons = list(c("alone", "inter")),
+      labels = c("alone" = "Competition-free", "inter" = "Competition")
+    ) +
+    labs(x = NULL, y = ylab, title = title) +
+    theme_Publication() + # facet_grid(. ~ comp_year) +
+    scale_linetype_manual(
+      values = c("alone" = "dotted", "inter" = "solid"),
+      labels = c("alone" = "Competition-free", "inter" = "Competition")
+    ) +
+    theme(legend.position = "none")
+}
+
+
+fig2a <- create_ind_trait_plot(all_indTrait_RGR_results, "Marginal_R2", "Marginal R²", "", "(a)") + 
+  theme_Publication(base_size = 14) + 
+  ylim(c(0, 0.28)) +
+  theme(legend.position = "none")
+
+all_indTrait_RGR_results$abs_estimate <- abs(all_indTrait_RGR_results$estimate)
+fig2b <- create_ind_trait_plot(all_indTrait_RGR_results, "abs_estimate","The absolute value of the slope","","(b)") + 
+  theme_Publication(base_size = 14) + 
+  ylim(c(0, 0.35)) +
+  theme(legend.position = "none")
+
+combined_fig2_legend <- (fig2a | fig2b) +
+  plot_layout(nrow = 1, guides = "collect") & 
+  theme(legend.position = "right", 
+    legend.direction = "vertical",  
+    legend.box = "vertical",  
+    legend.spacing.y = unit(0.5, "cm"),  
+    legend.key.size = unit(0.7, "cm"), 
+    axis.line = element_line(size = 1), 
+    axis.ticks = element_line(size = 1),
+    legend.text = element_text(size = 14),  
+        legend.title = element_text(size = 14))
+
+#combined_fig2_1
+
+### induvidual-level
+ind_tda_long <- gather(indtraits_tda, trait, values, trait.names)
+ind_tda_long <- ind_tda_long#[ind_tda_long$RGR > 0, ]
+ind_tda_long <- na.omit(ind_tda_long)
+ind_tda_long$comp_year <- factor(ind_tda_long$comp_year, levels = c("2nd", "3rd"))
+ind_tda_long$Nenv <- factor(ind_tda_long$Nenv, levels = c("6", "5", "4", "9", "2", "3", "7", "8", "1"))
+ind_tda_long$trait <- factor(ind_tda_long$trait, levels = trait.names)
+
+ind_com_fig <- ggplot(ind_tda_long, aes(x = values, y = RGR, col = Compete)) +
+  geom_point(alpha = 0.1, size = 1, aes(col = Compete)) +
+  facet_wrap(. ~ trait,
+    scales = "free", ncol = 5,
+    labeller = labeller(Compete = c("alone" = "Competition-free", "inter" = "Competition"))) +
+  geom_smooth(method = "lm", aes(group = Compete, fill = Compete), col = "black", alpha = 0.9, size = 0.15, se = TRUE) +
+  labs(title = "(c)", x = "Trait values", y = "RGR") +
+  theme_Publication() +
+  scale_color_manual(values = c("#6B8A7A", "#DAC0A3"), name = "Treatment", labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  scale_fill_manual(values = c("#6B8A7A", "#DAC0A3"), name = "Treatment", labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  theme_Publication(base_size = 14) +
+  theme(legend.position = "bottom",
+    legend.key.size = unit(0.4, "cm"),
+    legend.text = element_text(size = 15),
+    legend.title = element_blank()) +
+  scale_x_continuous(breaks = pretty(ind_tda_long$values, n = 5)) 
+
+#ind_com_fig
+
+# combined_fig2_1 <- ((fig2a / fig2b) | ind_com_fig) +plot_layout(widths = c(1, 2.5))
+combined_fig2ab <- fig2a + fig2b +plot_layout(ncol = 2)
+combined_fig2 <- (combined_fig2ab/ ind_com_fig) + plot_layout(heights = c(1.3, 2))
+combined_fig2
+
+topptx(combined_fig2_legend, filename = "02_output_results/figs/Fig.2_legend.pptx", height = 4, width = 8)
+topptx(combined_fig2ab,filename = "02_output_results/figs/Fig.2ab.pptx", height = 4, width = 8)
+ggsave(combined_fig2,filename = "02_output_results/figs/Fig.2_all_R2_slope.png", height = 10, width = 8)
+ggsave(combined_fig2,filename = "02_output_results/figs/Fig.2_all_R2_slope.pdf", height = 10, width = 8)
+ggsave(combined_fig2,filename = "02_output_results/figs/Fig.2_all_R2_slope.png", height = 10, width = 8)
+```
+
+```{r,fig.height=5,fig.width=10}
+################
+fig_s2a <- create_ind_trait_plot(indTrait_RGR_results, "Marginal_R2", "Marginal R²", "", "(a)") + theme_Publication(base_size = 14)+facet_grid(. ~ comp_year) + theme(axis.text.x = element_blank())
+indTrait_RGR_results$abs_estimate <- abs(indTrait_RGR_results$estimate)
+fig_s2b <- create_ind_trait_plot(indTrait_RGR_results, "abs_estimate","The absolute value of the slope","","(b)") + theme_Publication(base_size = 14)+
+  facet_grid(. ~ comp_year) + theme(axis.text.x = element_blank())
+
+combined_fig_s2ab <- fig_s2a + fig_s2b + plot_layout(ncol = 2, guides = "collect") &
+  theme(legend.position = "bottom",
+        legend.spacing.y = unit(0.15, "cm"),  
+    legend.key.size = unit(0.6, "cm"), 
+    axis.line = element_line(size = 1), 
+    axis.ticks = element_line(size = 1),
+    legend.text = element_text(size = 10),
+    legend.title = element_blank())
+
+combined_fig_s2ab
+
+topptx(combined_fig_s2ab,filename = "02_output_results/figs/Fig.S2_R2_slope.pptx", height = 5, width = 8)
+ggsave(combined_fig_s2ab,filename = "02_output_results/figs/Fig.S2_R2_slope.pdf", height = 4.5, width = 8)
+
+```
+
+### Other slopes
+```{r,fig.height=8,fig.width=10}
+both_indTrait_RGR_results <- rbind(all_indTrait_RGR_results, indTrait_RGR_results)
+both_indTrait_RGR_long_re <- both_indTrait_RGR_results %>%
+  pivot_longer(
+    cols = c("estimate", "TLestimate", "TMestimate", "TPestimate", "TYestimate"),
+    names_to = "Type",
+    values_to = "estimate")%>%
+  mutate(Type = case_when(
+    Type == "estimate" ~ "Trait",
+    Type == "TLestimate" ~ "Trait: Light",
+    Type == "TMestimate" ~ "Trait: Soil moisture",
+    Type == "TPestimate" ~ "Trait: Soil phosphorus",
+    Type == "TYestimate" ~ "Trait: Year"))
+both_indTrait_RGR_long_re$abs_estimate <- (abs(both_indTrait_RGR_long_re$estimate))
+
+figS2b <- create_ind_trait_plot(both_indTrait_RGR_long_re[both_indTrait_RGR_long_re$comp_year=="All"&both_indTrait_RGR_long_re$Type!="Trait",], "abs_estimate","The absolute value of the slope","Treament","") + facet_wrap(.~Type,ncol=2,scale="free")+
+  theme_Publication(base_size = 14) + 
+  theme(legend.position = "bottom", 
+    legend.spacing.y = unit(0.15, "cm"),  
+    legend.key.size = unit(0.5, "cm"), 
+    axis.line = element_line(size = 1), 
+    axis.ticks = element_line(size = 1),
+    legend.text = element_text(size = 11),  
+        legend.title = element_blank())+guides(
+      color = guide_legend(title = "trait"), # 显示trait的图例
+      shape = "none",    # 隐藏shape的图例
+      linetype = "none"  # 隐藏linetype的图例
+    )
+
+figS3 <- create_ind_trait_plot(both_indTrait_RGR_long_re[both_indTrait_RGR_long_re$Type!="Trait", ], "abs_estimate","Absolute estimates in trait—growth models","Treament","") + facet_wrap(.~Type,ncol=2,scale="free")+
+  theme_Publication(base_size = 14) +facet_grid(comp_year~Type,scale="free") + 
+  theme(legend.position = "bottom", 
+    legend.spacing.y = unit(0.15, "cm"),  
+    legend.key.size = unit(0.5, "cm"), 
+    axis.line = element_line(size = 1), 
+    axis.ticks = element_line(size = 1),
+    legend.text = element_text(size = 11),
+    axis.text.x = element_text(angle = 15),
+        legend.title = element_blank())+guides(
+      color = guide_legend(title = "trait"), # 显示trait的图例
+      shape = "none",    # 隐藏shape的图例
+      linetype = "none"  # 隐藏linetype的图例
+    )+ylim(c(0,0.18))
+
+figS3
+topptx(figS3, filename = "02_output_results/figs/Fig.S3_interaction_estimate.pptx", height = 9, width = 8)
+ggsave(figS3, filename = "02_output_results/figs/Fig.S3_interaction_estimate.pdf", height = 9, width = 8)
+
+topptx(figS2b, filename = "02_output_results/figs/Fig.S2_interaction_estimate.pptx", height = 9.5, width = 8.5)
+ggsave(figS2b, filename = "02_output_results/figs/Fig.S2_interaction_estimate.pdf", height = 9.5, width = 8.5)
+ggsave(figS2b, filename = "02_output_results/figs/Fig.S2_interaction_estimate.png", height = 8.5, width = 8)
+
+```
+
+## Figure S2 single model results
+```{r,fig.height=5,fig.width=10}
+all_indTrait_RGR_results$Significance <- ifelse(all_indTrait_RGR_results$p_value < 0.001, "***",
+  ifelse(all_indTrait_RGR_results$p_value < 0.01, "**",
+    ifelse(all_indTrait_RGR_results$p_value < 0.05, "*", "")
+  )
+)
+# Add significance stars based on p_value
+indTrait_RGR_results$Significance <- ifelse(indTrait_RGR_results$p_value < 0.001, "***",
+  ifelse(indTrait_RGR_results$p_value < 0.01, "**",
+    ifelse(indTrait_RGR_results$p_value < 0.05, "*", "")
+  )
+)
+indTrait_RGR_results1 <- rbind(all_indTrait_RGR_results, indTrait_RGR_results)
+
+fig_s2a <- ggplot(indTrait_RGR_results1, aes(x = reorder(trait, Marginal_R2), y = Marginal_R2, fill = Compete)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_grid(. ~ comp_year) +
+  theme_Publication() +
+  coord_flip() +
+  labs(title = "(a)", x = "Trait", y = expression("Marginal" ~ R^2, "of trait-growth models")) +
+  scale_color_manual(values = c("#6B8A7A", "#DAC0A3"), name = "Treatment", labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  scale_fill_manual(values = c("#6B8A7A", "#DAC0A3"), name = "Treatment", labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+fig_s2b <- ggplot(indTrait_RGR_results1, aes(x = reorder(trait, Marginal_R2), y = estimate, fill = Compete)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_grid(. ~ comp_year) +
+  theme_Publication() +
+  coord_flip() +
+  labs(title = "(b)", x = "", y = "Estimate of trait in growth models") +
+  scale_color_manual(values = c("#6B8A7A", "#DAC0A3"), name = "Treatment", labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  scale_fill_manual(values = c("#6B8A7A", "#DAC0A3"), name = "Treatment", labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+combined_figS3 <- fig_s2a + fig_s2b + plot_layout(ncol = 2, guides = "collect")&
+  theme(legend.position = "bottom",
+    legend.key.size = unit(0.4, "cm"),
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 12))
+combined_figS3
+topptx(combined_figS3,filename = "02_output_results/figs/fig_s2_r2_slopes_onlytrait_models.pptx", height = 5, width = 8)
+ggsave(combined_figS3,filename = "02_output_results/figs/fig_s3_r2_slopes_onlytrait_models.png", height = 5, width = 8)
+```
+
+## simple linear regression
+```{r,fig.height=15, fig.width=15}
+ind_com_fig + facet_wrap(comp_year ~ trait,
+  scales = "free", ncol = 5,
+  labeller = labeller(Compete = c("alone" = "Competition-free", "inter" = "Competition"))
+)
+```
+
+## Figure 3 trait variability and RGR
+```{r,fig.height=4.5,fig.width=8}
+fric_indtrait <- ggplot(all_indTrait_RGR_results, aes(x = Compete, y = Fric, group = Compete)) +
+  geom_boxplot(position = position_dodge(width = 0.5), aes(group = Compete, fill = Compete), width = 0.5, alpha = 0.5) +
+  scale_fill_manual(values = c("#6B8A7A", "#DAC0A3"), labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  scale_shape_manual(values = c(1, 19), labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  stat_compare_means(
+    method = "t.test", paired = TRUE,
+    comparisons = list(c("alone", "inter")), labels = c("alone" = "Competition-free", "inter" = "Competition")
+  ) +
+  labs(x = NULL, y = "Trait variability", title = "(a)") +
+  theme_Publication() +
+  scale_x_discrete(labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  theme(legend.position = "none")#+ ylim(c(2.8, 5))
+
+rgr_indtrait <- ggplot(indtraits_tda, aes(x = Compete, y = RGR, group = Compete)) +
+  geom_boxplot(position = position_dodge(width = 0.5), aes(group = Compete, fill = Compete), width = 0.5, alpha = 0.5) +
+  scale_fill_manual(values = c("#6B8A7A", "#DAC0A3"), labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  scale_shape_manual(values = c(1, 19), labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  stat_compare_means(
+    method = "t.test",
+    comparisons = list(c("alone", "inter")), labels = c("alone" = "Competition-free", "inter" = "Competition")
+  ) +
+  labs(x = NULL, y = "Relative growth rate (RGR)", title = "(b)") +
+  theme_Publication() +
+  scale_x_discrete(labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  theme(legend.position = "none")#+ ylim(c(0, 1.2))
+
+combined.fig3ab <- fric_indtrait + rgr_indtrait + plot_layout(ncol = 2, guides = "collect")&
+  theme(legend.position = "bottom",
+    legend.key.size = unit(0.7, "cm"),
+    legend.text = element_text(size = 13),
+    legend.title = element_blank())
+
+combined.fig3ab
+topptx(combined.fig3ab, filename = "02_output_results/figs/Fig.3_TV_RGR.pptx", height = 4, width = 7)
+ggsave(combined.fig3ab, filename = "02_output_results/figs/Fig.3_TV_RGR.pdf", height = 4, width = 7)
+
+itv_indtrait <- ggplot(indTrait_RGR_results, aes(x = comp_year, y = Fric, fill = Compete)) +
+  geom_boxplot(position = position_dodge(width = 0.7), width = 0.5, alpha = 0.5) +  
+  scale_fill_manual(values = c("#6B8A7A", "#DAC0A3"), labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  stat_compare_means(
+    method = "t.test", paired = TRUE,
+    comparisons = list(c("alone", "inter")), 
+    label = "p.signif") +
+  labs(x = "Year under competition", y = "Trait variability", title = "(a)") +
+  theme_Publication() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 1),  
+        legend.position = "bottom", 
+        legend.key.size = unit(0.4, "cm"),
+        legend.text = element_text(size = 10),  
+        legend.title = element_text(size = 12)) #+ ylim(c(2.8, 5))
+
+rgr_indtrait1 <- ggplot(indtraits_tda, aes(x = comp_year, y = RGR, fill = Compete)) +
+  geom_boxplot(position = position_dodge(width = 0.8), width = 0.5, alpha = 0.5) +  # 增加 position_dodge 的 width
+  scale_fill_manual(values = c("#6B8A7A", "#DAC0A3"), 
+                    labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  stat_compare_means(method = "t.test",comparisons = list(c("alone", "inter")), label = "p.signif" ) +
+  labs(x = "Year under competition", y = "Relative growth rate (RGR)", title = "(b)") +
+  theme_Publication() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 1)) 
+
+combind_figS3_1 <- itv_indtrait + rgr_indtrait1 + plot_layout(ncol = 2, guides = "collect")&
+  theme(legend.position = "bottom",
+    legend.key.size = unit(0.7, "cm"),
+    legend.text = element_text(size = 13),
+    legend.title = element_blank())
+
+combind_figS3_1
+topptx(combind_figS3_1,filename = "02_output_results/figs/Fig.s3_TV_RGR.pptx", height = 4.5, width = 8)
+ggsave(combind_figS3_1,filename = "02_output_results/figs/Fig.s3_TV_RGR.pdf", height = 4.5, width = 8)
+```
+
+## Figure X. all diversity indexs
+```{r,fig.height=8,fig.width=8}
+Fric_indtrait1 <- ggplot(indTrait_RGR_results, aes(x = Compete, y = Fric, group = Compete)) +
+  geom_boxplot(position = position_dodge(width = 0.5), aes(group = Compete, fill = Compete), width = 0.5, alpha = 0.5) +
+  scale_fill_manual(values = c("#6B8A7A", "#DAC0A3"), labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  scale_shape_manual(values = c(1, 19), labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  stat_compare_means(
+    method = "t.test", paired = TRUE,
+    comparisons = list(c("alone", "inter")), labels = c("alone" = "Competition-free", "inter" = "Competition")
+  ) +
+  labs(x = "Year under competition", y = "Trait variability", title = "(a)") +
+  theme_Publication() +
+  facet_grid(. ~ comp_year) +
+  theme(axis.text.x = element_blank()) #+ ylim(c(0.05, 0.6))
+
+rgr_indtrait1 <- ggplot(indtraits_tda, aes(x = Compete, y = RGR, group = Compete)) +
+  geom_boxplot(position = position_dodge(width = 0.5), aes(group = Compete, fill = Compete), width = 0.5, alpha = 0.5) + facet_grid(. ~ comp_year) +
+  scale_fill_manual(values = c("#6B8A7A", "#DAC0A3"), labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  scale_shape_manual(values = c(1, 19), labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  stat_compare_means(
+    method = "t.test",
+    comparisons = list(c("alone", "inter")), labels = c("alone" = "Competition-free", "inter" = "Competition")
+  ) +
+  labs(x = "Year under competition", y = "Relative growth rate (RGR)", title = "(b)") +
+  theme_Publication() +
+  scale_x_discrete(labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  theme(legend.position = "none", axis.text.x = element_blank())#+ ylim(c(0, 1.2))
+
+
+Fdiv_indtrait <- ggplot(indTrait_RGR_results, aes(x = Compete, y = Fdiv, group = Compete)) +
+  geom_boxplot(position = position_dodge(width = 0.5), aes(group = Compete, fill = Compete), width = 0.5, alpha = 0.5) +
+  scale_fill_manual(values = c("#6B8A7A", "#DAC0A3"), labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  scale_shape_manual(values = c(1, 19), labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  stat_compare_means(
+    method = "t.test", paired = TRUE,
+    comparisons = list(c("alone", "inter")), labels = c("alone" = "Competition-free", "inter" = "Competition")
+  ) +
+  labs(x = "Year under competition", y = "FDiv", title = "(b)") +
+  theme_Publication() +
+  facet_grid(. ~ comp_year) +
+  theme(axis.text.x = element_blank()) #+ ylim(c(0.05, 0.6))
+
+indTrait_RGR_results1 <- rbind(all_indTrait_RGR_results, indTrait_RGR_results)
+spitv_indtrait <- ggplot(indTrait_RGR_results1, aes(x = comp_year, y = sp_ITV, fill = Compete)) +
+  geom_boxplot(position = position_dodge(width = 0.7), width = 0.5, alpha = 0.5) +  
+  scale_fill_manual(values = c("#6B8A7A", "#DAC0A3"), labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  stat_compare_means(method = "t.test", paired = TRUE,
+    comparisons = list(c("alone", "inter")), labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  labs(x = "Year under competition", y = "ITV", title = "(c)") +
+  theme_Publication() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 1),  
+        legend.position = "bottom",  
+        legend.key.size = unit(0.4, "cm"),
+        legend.text = element_text(size = 10),  
+        legend.title = element_text(size = 12))  
+
+fig_sp_itv <- ggplot(both_indTrait_RGR_results, aes(x = Compete, y = sp_ITV, group = Compete)) +
+  geom_boxplot(position = position_dodge(width = 0.5), aes(group = Compete, fill = Compete), width = 0.5, alpha = 0.5) +
+  scale_fill_manual(values = c("#6B8A7A", "#DAC0A3"), labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  scale_shape_manual(values = c(1, 19), labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  stat_compare_means(
+    method = "t.test", paired = TRUE,
+    comparisons = list(c("alone", "inter")), labels = c("alone" = "Competition-free", "inter" = "Competition")
+  ) +
+  labs(x = "Year under competition", y = "Intraspecific trait variability", title = "(a)") +
+  theme_Publication(base_size = 13) +
+  facet_grid(. ~ comp_year) +
+  theme(axis.text.x = element_blank()) #+ ylim(c(0.05, 0.6))
+
+
+interdis_indtrait <- ggplot(both_indTrait_RGR_results, aes(x = Compete, y = inter_dis, group = Compete)) +
+  geom_boxplot(position = position_dodge(width = 0.5), aes(group = Compete, fill = Compete), width = 0.5, alpha = 0.5) +
+  scale_fill_manual(values = c("#6B8A7A", "#DAC0A3"), labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  scale_shape_manual(values = c(1, 19), labels = c("alone" = "Competition-free", "inter" = "Competition")) +
+  stat_compare_means(
+    method = "t.test", paired = TRUE,
+    comparisons = list(c("alone", "inter")), labels = c("alone" = "Competition-free", "inter" = "Competition")
+  ) +
+  labs(x = "Year under competition", y = "Interspecific trait dissimilarity", title = "(b)") +
+  theme_Publication(base_size = 13) +
+  facet_grid(. ~ comp_year) +
+  theme(axis.text.x = element_blank()) #+ ylim(c(0.05, 0.6))
+
+Fric_indtrait1 + rgr_indtrait1 + plot_layout(ncol = 2)
+fig_sp_itv + interdis_indtrait + plot_layout(ncol = 2)
+
+combined.figS4 <- fig_sp_itv + interdis_indtrait + plot_layout(ncol = 2, guides = "collect")&
+  theme(legend.position = "bottom",
+    legend.key.size = unit(0.7, "cm"),
+    legend.text = element_text(size = 13),
+    legend.title = element_blank())
+
+
+combined.figS4a <- Fric_indtrait1 + rgr_indtrait1 + plot_layout(ncol = 2, guides = "collect")&
+  theme(legend.position = "bottom",
+    legend.key.size = unit(0.7, "cm"),
+    legend.text = element_text(size = 13),
+    legend.title = element_blank())
+topptx(combined.figS4a, filename = "02_output_results/figs/Fig.S4a_TV_RGR_peryear.pptx", height = 4, width = 8)
+ggsave(combined.figS4a, filename = "02_output_results/figs/Fig.S4a_TV_RGR_peryear.pdf", height = 4, width = 7)
+
+combined.figS4
+topptx(combined.figS4, filename = "02_output_results/figs/Fig.S4_ITV_ITD.pptx", height = 4, width = 8)
+ggsave(combined.figS4, filename = "02_output_results/figs/Fig.S4_ITV_ITD.pdf", height = 4, width = 7)
+```
+
+## Figure 3 Mixed-effect model
+```{r,fig.height=5,fig.width=6}
+# Add the 'growth_year' column based on the 'comp_year' column
+indTrait_RGR_results$growth_year <- ifelse(indTrait_RGR_results$comp_year == "2nd", 2,
+  ifelse(indTrait_RGR_results$comp_year == "3rd", 3, 1))
+
+# View the updated data structure
+indTrait_RGR_results$growth_year <- scale(indTrait_RGR_results$growth_year)
+
+ind_trait_model_beta <- glmmTMB(Marginal_R2 ~ com_ITV + com_ITV:Compete + RGR_mean + (1 | trait),
+  data = all_indTrait_RGR_results,
+  family = beta_family()
+)
+
+summary(ind_trait_model_beta)
+# Load the glmmTMB package for advanced mixed-effects models
+library(glmmTMB)
+# Fit a Beta regression model using glmmTMB()
+ind_trait_model_beta <- glmmTMB(
+  Marginal_R2 ~ com_ITV + com_ITV:Compete + RGR_mean + growth_year + (1 | trait),
+  data = indTrait_RGR_results,
+  family = beta_family()
+)
+
+summary(ind_trait_model_beta)
+r.squaredGLMM(ind_trait_model_beta)
+
+# Extract coefficients and confidence intervals
+coef_ind_cr <- broom.mixed::tidy(ind_trait_model_beta, effects = "fixed", conf.int = TRUE)
+coef_ind_cr <- coef_ind_cr[coef_ind_cr$term != "(Intercept)", ]
+coef_ind_cr$col <- ifelse(coef_ind_cr$conf.low * coef_ind_cr$conf.high < 0, "white", "black")
+colnames(coef_ind_cr)[2] <- "Parameter"
+Parameter_names <- c("Trait variability", "Mean growth rate", "Year", "Trait variability:Competition")
+# Define parameter levels and plot
+coef_ind_cr$Parameter <- factor(Parameter_names, levels = c("Year", "Mean growth rate", "Trait variability:Competition", "Trait variability"))
+fig_traitvar <- ggplot(coef_ind_cr, aes(x = Parameter, y = estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.4) +
+  geom_point(shape = 21, fill = coef_ind_cr$col, lwd = 4, size = 3) +
+  xlab(NULL) +
+  ylab(expression("Effect size of " * italic("Marginal R"^2) * " in trait-growth")) +
+  ggtitle("(c)") +
+  theme_Publication(base_family = "sans") +
+  coord_flip() +
+  geom_rect(aes(ymin = -Inf, ymax = Inf, xmin = 3.55, xmax = 4.45), fill = "#6B8A7A", color = NA, alpha = 0.1) +
+  geom_rect(aes(ymin = -Inf, ymax = Inf, xmin = 2.55, xmax = 3.45), fill = "#DAC0A3", color = NA, alpha = 0.1) +
+  geom_rect(aes(ymin = -Inf, ymax = Inf, xmin = 0.55, xmax = 2.45), fill = "grey", color = NA, alpha = 0.1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_point(shape = 21, fill = coef_ind_cr$col, lwd = 4, size = 3)
+
+fig_traitvar
+# itv_indtrait + rgr_indtrait + fig_traitvar + plot_layout(ncol = 2, nrow = 2, design = "ABCC")
+topptx(fig_traitvar,
+  filename = "02_output_results/figs/Fig3.2_mixed_effect_model.pptx", height = 5, width = 7
+)
+
+library(ggrepel)
+r_square_itv <- ggplot(indTrait_RGR_results, aes(x = (com_ITV), y = Marginal_R2, color = Compete)) +
+  geom_point(alpha = 1, size = 2) + # Add points with transparency for better visualization
+  geom_smooth(method = "lm", size = 1, alpha = 0.5, fill="grey70") +
+  geom_text_repel(aes(label = trait), size = 3, max.overlaps = 10) +
+  labs(x = "ITV", y = "Marginal R²", color = "Compete") + # Axis and legend labels
+  theme_Publication() +
+  facet_grid(. ~ comp_year) +
+  stat_poly_eq(
+    method = "lm",
+    aes(label = paste(after_stat(rr.label),
+      after_stat(p.value.label),
+      sep = "*\", \"*"
+    )), size = 3
+  ) + 
+  theme(legend.position = "bottom",
+    legend.key.size = unit(0.4, "cm"),
+    legend.text = element_text(size = 15),
+    legend.title = element_blank()) +
+  scale_color_manual(values = c("#6B8A7A", "#DAC0A3"), labels = c("alone" = "Competition-free", "inter" = "Competition"))
+r_square_itv
+```
+
+------------
+## Supplementary
+
+### Figure SX Fric - Mixed-effect model
+```{r,fig.height=5,fig.width=8}
+# Fit a Beta regression model using glmmTMB()
+all_ind_trait_model_beta <- glmmTMB(Marginal_R2 ~ Fric + Fric:Compete + RGR_mean + (1 | trait),
+  data = all_indTrait_RGR_results, family = beta_family())
+summary(all_ind_trait_model_beta)
+
+ind_trait_model_beta <- glmmTMB(
+  Marginal_R2 ~ Fric + Fric:Compete + RGR_mean +(1 | trait) + (1 | comp_year),
+  data = indTrait_RGR_results,  family = beta_family())
+
+summary(ind_trait_model_beta)
+r.squaredGLMM(ind_trait_model_beta)
+
+###################################################
+ind_trait_model_beta1 <- glmmTMB(Marginal_R2 ~ Fric + Fric:Compete + (1 | trait),
+  data = all_indTrait_RGR_results, family = beta_family())
+summary(ind_trait_model_beta1)
+
+ind_trait_model_beta2 <- glmmTMB(Marginal_R2 ~ RGR_mean + (1 | trait),
+  data = all_indTrait_RGR_results,  family = beta_family())
+summary(ind_trait_model_beta2)
+
+ind_trait_model_beta1 <- glmmTMB(Marginal_R2 ~ Fric + Fric:Compete + (1 | trait) + (1|comp_year),
+  data = indTrait_RGR_results, family = beta_family())
+summary(ind_trait_model_beta1)
+
+ind_trait_model_beta2 <- glmmTMB(Marginal_R2 ~ RGR_mean + growth_year + (1 | trait),
+  data = indTrait_RGR_results,  family = beta_family())
+summary(ind_trait_model_beta2)
+
+# Extract coefficients and confidence intervals
+coef_ind_cr1 <- broom.mixed::tidy(ind_trait_model_beta1, effects = "fixed", conf.int = TRUE)
+coef_ind_cr1 <- coef_ind_cr1[coef_ind_cr1$term != "(Intercept)", ]
+coef_ind_cr2 <- broom.mixed::tidy(ind_trait_model_beta2, effects = "fixed", conf.int = TRUE)
+coef_ind_cr2 <- coef_ind_cr2[coef_ind_cr2$term != "(Intercept)", ]
+coef_ind_cr <- rbind(coef_ind_cr1, coef_ind_cr2)
+coef_ind_cr$col <- ifelse(coef_ind_cr$conf.low * coef_ind_cr$conf.high < 0, "white", "black")
+colnames(coef_ind_cr)[2] <- "Parameter"
+Parameter_names <- c("Trait variability", "Trait variability:Competition","Mean growth rate","Growth year")
+
+# Define parameter levels and plot
+coef_ind_cr$Parameter <- factor(Parameter_names, levels = c("Growth year","Mean growth rate","Trait variability:Competition", "Trait variability"))
+fig3c <- ggplot(coef_ind_cr, aes(x = Parameter, y = estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.4) +
+  geom_point(shape = 21, fill = coef_ind_cr$col, lwd = 4, size = 3) +
+  xlab(NULL) +
+  ylab(expression("Effect size of " * italic("Marginal R"^2) * " in trait-growth")) +
+  ggtitle("(c)") +
+  theme_Publication(base_family = "sans",base_size = 14) +
+  coord_flip() +
+  geom_rect(aes(ymin = -Inf, ymax = Inf, xmin = 3.55, xmax = 4.45), fill = "#6B8A7A", color = NA, alpha = 0.1) +
+  geom_rect(aes(ymin = -Inf, ymax = Inf, xmin = 2.55, xmax = 3.45), fill = "#DAC0A3", color = NA, alpha = 0.1) +
+  geom_rect(aes(ymin = -Inf, ymax = Inf, xmin = 0.55, xmax = 2.45), fill = "grey60", color = NA, alpha = 0.1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_point(shape = 21, fill = coef_ind_cr$col, lwd = 4, size = 3)
+
+fig3c
+
+
+combined.fig3 <- (fric_indtrait|rgr_indtrait)/fig3c + 
+  plot_layout(heights = c(1, 0.75))
+
+combined.fig3
+topptx(combined.fig3ab, filename = "02_output_results/figs/Fig.3ab_TV_RGR.pptx", height = 4, width = 7)
+ggsave(combined.fig3ab, filename = "02_output_results/figs/Fig.3ab_TV_RGR.pdf", height = 4, width = 7)
+
+topptx(fig3c, filename = "02_output_results/figs/Fig.3c.pptx", height = 4, width = 7)
+ggsave(fig3c, filename = "02_output_results/figs/Fig.3c.pdf", height = 4, width = 7)
+
+
+library(ggrepel)
+figS3c <- ggplot(both_indTrait_RGR_results, aes(x = Fric, y = Marginal_R2, color = Compete)) +
+   geom_point(alpha = 1, size = 2) + # Add points with transparency for better visualization
+  geom_smooth(method = "lm", size = 1, alpha = 0.5, fill="grey70",se=F) +
+  geom_text_repel(aes(label = trait), size = 3.6, max.overlaps = 10) +
+  labs(x = "Trait variability", y = "Marginal R²", color = "Compete") + # Axis and legend labels
+  facet_grid(. ~ comp_year,scale="free") +
+  stat_poly_eq(
+    method = "lm",
+    aes(label = paste(after_stat(rr.label),
+      after_stat(p.value.label),
+      sep = "*\", \"*"
+    )), size = 3
+  ) +theme_Publication(base_size = 14)+ 
+  theme(legend.position = "bottom",
+    legend.key.size = unit(0.7, "cm"),
+    legend.text = element_text(size = 13),
+    legend.spacing.y = unit(0.7, "cm"),  
+    legend.title = element_blank()) + ylim(c(0,0.34)) +
+  scale_color_manual(values = c("#6B8A7A", "#DAC0A3"), 
+                     labels = c("alone" = "Competition-free", "inter" = "Competition"))
+
+figS3c
+topptx(figS3c, filename = "02_output_results/figs/Fig.S3c.pptx", height = 4, width = 8)
+ggsave(figS3c, filename = "02_output_results/figs/Fig.S3c.pdf", height = 4, width = 8)
+
+
+```
+
+### Figure SX sp_slope_cv - Mixed-effect model
+```{r,fig.height=5,fig.width=8}
+ind_trait_model_beta <- glmmTMB(Marginal_R2 ~ sp_slope_cv + sp_slope_cv:Compete + (1 | trait),
+  data = all_indTrait_RGR_results,
+  family = beta_family()
+)
+
+summary(ind_trait_model_beta)
+# Fit a Beta regression model using glmmTMB()
+ind_trait_model_beta <- lmer(
+  estimate ~ sp_slope_cv + sp_slope_cv:Compete + (1 | trait) + (1 | comp_year),
+  data = indTrait_RGR_results
+)
+
+summary(ind_trait_model_beta)
+r.squaredGLMM(ind_trait_model_beta)
+
+# Extract coefficients and confidence intervals
+coef_ind_cr <- broom.mixed::tidy(ind_trait_model_beta, effects = "fixed", conf.int = TRUE)
+coef_ind_cr <- coef_ind_cr[coef_ind_cr$term != "(Intercept)", ]
+coef_ind_cr$col <- ifelse(coef_ind_cr$conf.low * coef_ind_cr$conf.high < 0, "white", "black")
+colnames(coef_ind_cr)[2] <- "Parameter"
+Parameter_names <- c("sp_slope_cv", "sp_slope_cv:Competition")
+# Define parameter levels and plot
+coef_ind_cr$Parameter <- factor(Parameter_names, levels = c("sp_slope_cv:Competition", "sp_slope_cv"))
+fig_traitvar <- ggplot(coef_ind_cr, aes(x = Parameter, y = estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.4) +
+  geom_point(shape = 21, fill = coef_ind_cr$col, lwd = 4, size = 3) +
+  xlab(NULL) +
+  ylab(expression("Effect size of " * italic("Marginal R"^2) * " in trait-growth")) +
+  ggtitle("(c)") +
+  theme_Publication(base_family = "sans") +
+  coord_flip() +
+  geom_rect(aes(ymin = -Inf, ymax = Inf, xmin = 1.55, xmax = 2.45), fill = "#6B8A7A", color = NA, alpha = 0.1) +
+  geom_rect(aes(ymin = -Inf, ymax = Inf, xmin = 0.55, xmax = 1.45), fill = "#DAC0A3", color = NA, alpha = 0.1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_point(shape = 21, fill = coef_ind_cr$col, lwd = 4, size = 3)
+
+fig_traitvar
+
+library(ggrepel)
+r_square_itv <- ggplot(indTrait_RGR_results, aes(x = sp_slope_cv, y = estimate, color = Compete)) +
+  geom_point(alpha = 0.7, size = 2) + # Add points with transparency for better visualization
+  geom_smooth(method = "lm", size = 1, alpha = 0.5) +
+  geom_text_repel(aes(label = trait), size = 3, max.overlaps = 10) +
+  labs(x = "Estimate", y = "Marginal R²", color = "Compete") + # Axis and legend labels
+  theme_Publication() +
+  facet_grid(. ~ comp_year) +
+  stat_poly_eq(
+    method = "lm",
+    aes(label = paste(after_stat(rr.label),
+      after_stat(p.value.label),
+      sep = "*\", \"*"
+    )), size = 3
+  ) +
+  scale_color_manual(values = c("#609966", "#FFBF61"), labels = c("alone" = "Competition-free", "inter" = "Competition"))
+r_square_itv
+```
+
+### Figure SX Fdiv - Mixed-effect model
+```{r,fig.height=5,fig.width=8}
+# Fit a Beta regression model using glmmTMB()
+ind_trait_model_beta <- glmmTMB(
+  Marginal_R2 ~ Fdiv + Fdiv:Compete + (1 | trait) + (1 | comp_year),
+  data = indTrait_RGR_results,
+  family = beta_family()
+)
+
+summary(ind_trait_model_beta)
+r.squaredGLMM(ind_trait_model_beta)
+
+# Extract coefficients and confidence intervals
+coef_ind_cr <- broom.mixed::tidy(ind_trait_model_beta, effects = "fixed", conf.int = TRUE)
+coef_ind_cr <- coef_ind_cr[coef_ind_cr$term != "(Intercept)", ]
+coef_ind_cr$col <- ifelse(coef_ind_cr$conf.low * coef_ind_cr$conf.high < 0, "white", "black")
+colnames(coef_ind_cr)[2] <- "Parameter"
+Parameter_names <- c("Fdiv", "Fdiv:Competition")
+# Define parameter levels and plot
+coef_ind_cr$Parameter <- factor(Parameter_names, levels = c("Fdiv:Competition", "Fdiv"))
+fig_traitvar <- ggplot(coef_ind_cr, aes(x = Parameter, y = estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.4) +
+  geom_point(shape = 21, fill = coef_ind_cr$col, lwd = 4, size = 3) +
+  xlab(NULL) +
+  ylab(expression("Effect size of " * italic("Marginal R"^2) * " in trait-growth")) +
+  ggtitle("(c)") +
+  theme_Publication(base_family = "sans") +
+  coord_flip() +
+  geom_rect(aes(ymin = -Inf, ymax = Inf, xmin = 1.55, xmax = 2.45), fill = "#6B8A7A", color = NA, alpha = 0.1) +
+  geom_rect(aes(ymin = -Inf, ymax = Inf, xmin = 0.55, xmax = 1.45), fill = "#DAC0A3", color = NA, alpha = 0.1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_point(shape = 21, fill = coef_ind_cr$col, lwd = 4, size = 3)
+
+fig_traitvar
+
+library(ggrepel)
+r_square_itv <- ggplot(indTrait_RGR_results, aes(x = Fdiv, y = Marginal_R2, color = Compete)) +
+  geom_point(alpha = 0.7, size = 2) + # Add points with transparency for better visualization
+  geom_smooth(method = "lm", size = 1, alpha = 0.5) +
+  geom_text_repel(aes(label = trait), size = 3, max.overlaps = 10) +
+  labs(x = "Fdiv", y = "Marginal R²", color = "Compete") + # Axis and legend labels
+  theme_Publication() +
+  facet_grid(. ~ comp_year) +
+  stat_poly_eq(
+    method = "lm",
+    aes(label = paste(after_stat(rr.label),
+      after_stat(p.value.label),
+      sep = "*\", \"*"
+    )), size = 3
+  ) +
+  scale_color_manual(values = c("#609966", "#FFBF61"), labels = c("alone" = "Competition-free", "inter" = "Competition"))
+r_square_itv
+```
+
+### Figure 2 sp_ITV Mixed-effect model
+```{r,fig.height=5,fig.width=6}
+# Load the glmmTMB package for advanced mixed-effects models
+library(glmmTMB)
+# Fit a Beta regression model using glmmTMB()
+ind_trait_model_beta <- glmmTMB(
+  Marginal_R2 ~ sp_ITV + sp_ITV:Compete + (1 | trait) + (1 | comp_year),
+  data = indTrait_RGR_results,
+  family = beta_family()
+)
+
+summary(ind_trait_model_beta)
+r.squaredGLMM(ind_trait_model_beta)
+
+# Extract coefficients and confidence intervals
+coef_ind_cr <- broom.mixed::tidy(ind_trait_model_beta, effects = "fixed", conf.int = TRUE)
+coef_ind_cr <- coef_ind_cr[coef_ind_cr$term != "(Intercept)", ]
+coef_ind_cr$col <- ifelse(coef_ind_cr$conf.low * coef_ind_cr$conf.high < 0, "white", "black")
+colnames(coef_ind_cr)[2] <- "Parameter"
+Parameter_names <- c("Trait variability", "Trait variability:Competition")
+# Define parameter levels and plot
+coef_ind_cr$Parameter <- factor(Parameter_names, levels = c("Year", "Mean growth rate", "Trait variability:Competition", "Trait variability"))
+fig_traitvar <- ggplot(coef_ind_cr, aes(x = Parameter, y = estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.4) +
+  geom_point(shape = 21, fill = coef_ind_cr$col, lwd = 4, size = 3) +
+  xlab(NULL) +
+  ylab(expression("Effect size of " * italic("Marginal R"^2) * " in trait-growth")) +
+  ggtitle("(c)") +
+  theme_Publication(base_family = "sans") +
+  coord_flip() +
+  geom_rect(aes(ymin = -Inf, ymax = Inf, xmin = 1.55, xmax = 2.45), fill = "#6B8A7A", color = NA, alpha = 0.1) +
+  geom_rect(aes(ymin = -Inf, ymax = Inf, xmin = 0.55, xmax = 1.45), fill = "#DAC0A3", color = NA, alpha = 0.1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_point(shape = 21, fill = coef_ind_cr$col, lwd = 4, size = 3)
+
+fig_traitvar
+# itv_indtrait + rgr_indtrait + fig_traitvar + plot_layout(ncol = 2, nrow = 2, design = "ABCC")
+topptx(fig_traitvar,
+  filename = "02_output_results/figs/Fig3.2_mixed_effect_model.pptx", height = 5, width = 7
+)
+
+library(ggrepel)
+r_square_itv <- ggplot(indTrait_RGR_results, aes(x = (com_ITV), y = Marginal_R2, color = Compete)) +
+  geom_point(alpha = 0.7, size = 2) + # Add points with transparency for better visualization
+  geom_smooth(method = "lm", size = 1, alpha = 0.5) +
+  geom_text_repel(aes(label = trait), size = 3, max.overlaps = 10) +
+  labs(x = "ITV", y = "Marginal R²", color = "Compete") + # Axis and legend labels
+  theme_Publication() +
+  facet_grid(. ~ comp_year) +
+  stat_poly_eq(
+    method = "lm",
+    aes(label = paste(after_stat(rr.label),
+      after_stat(p.value.label),
+      sep = "*\", \"*"
+    )), size = 3
+  ) +
+  scale_color_manual(values = c("#609966", "#FFBF61"), labels = c("alone" = "Competition-free", "inter" = "Competition"))
+r_square_itv
+```
+
+### Figure SX spITV and comITV
+```{r}
+ind_trait_model2 <- lmerTest::lmer(Marginal_R2 ~ RGR_mean + com_ITV + sp_ITV + com_ITV:Compete + sp_ITV:Compete + (1 | comp_year) + (1 | trait),
+  data = indTrait_RGR_results
+)
+tab_model(ind_trait_model2)
+# Figure
+coef_ind_cr <- rbind(effectsize(ind_trait_model2)[2:6, ])
+colnames(coef_ind_cr)[2:3] <- c("Std_Coefficient", "CI")
+coef_ind_cr$col <- "black"
+coef_ind_cr$col[coef_ind_cr$CI_low * coef_ind_cr$CI_high < 0] <- "white"
+coef_ind_cr$Parameter <- factor(c("Mean RGR", "Community trait variability", "Species trait variability", "Community trait variability:Competition", "Species trait variability:Competition"),
+  levels = c("Mean RGR", "Community trait variability:Competition", "Species trait variability:Competition", "Community trait variability", "Species trait variability")
+)
+
+fig_traitvar_RGR <- ggplot(coef_ind_cr, aes(x = Parameter, y = Std_Coefficient)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = 0.4) +
+  geom_point(shape = 21, fill = coef_ind_cr$col, lwd = 4, size = 3) +
+  xlab(NULL) +
+  ylab(expression("Effect size of " * italic("Marginal R"^2) * " in trait-growth")) +
+  ggtitle("") +
+  theme_Publication(base_family = "sans") +
+  coord_flip() +
+  geom_rect(aes(ymin = -Inf, ymax = Inf, xmin = 3.55, xmax = 5.45), fill = "#6B8A7A", color = NA, alpha = 0.1) +
+  geom_rect(aes(ymin = -Inf, ymax = Inf, xmin = 1.55, xmax = 3.45), fill = "#DAC0A3", color = NA, alpha = 0.1) +
+  geom_rect(aes(ymin = -Inf, ymax = Inf, xmin = 0.55, xmax = 1.45), fill = "grey", color = NA, alpha = 0.1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = 0.4) +
+  geom_point(shape = 21, fill = coef_ind_cr$col, lwd = 4, size = 3)
+
+fig_traitvar_RGR
+```
+
+### Figure 3-2 SEM
+```{r,fig.height=5,fig.width=6}
+library(piecewiseSEM)
+data.sem <- all_indTrait_RGR_results[, c("Compete", "comp_year", "com_ITV", "RGR_mean", "Fric", "Marginal_R2", "trait")]
+data.sem$Compete <- ifelse(data.sem$Compete == "alone", 0,
+  ifelse(data.sem$Compete == "inter", 1, NA))
+data.sem$Compete <- (as.numeric(data.sem$Compete))
+data.sem.na <- data.sem
+data.sem <- na.omit(data.sem)
+
+sem_fit_full2 <- psem(
+  lmer(RGR_mean ~ Compete + (1 | trait) , na.action = na.omit, data = data.sem),
+  lmer(com_ITV ~ Compete + (1 | trait) , na.action = na.omit, data = data.sem),
+  lmer(Marginal_R2 ~ Compete * com_ITV + RGR_mean  + (1 | trait), na.action = na.omit, data = data.sem)
+)
+# summary(sem_fit_full2, standardized = TRUE, fit.measures = TRUE, rsquare = TRUE)
+# Run summary
+# (sem.sum2 <- summary(sem_fit_full2))
+# sem.sum2$coefficients
+plot(sem_fit_full2, node_attrs = list(shape = "rectangle", color = "white", fillcolor = "white"), digits = 2)
+
+########################
+sem_fit_full2 <- psem(
+  lmer(RGR_mean ~ Compete + (1 | trait) , na.action = na.omit, data = data.sem),
+  lmer(Fric ~ Compete + (1 | trait) , na.action = na.omit, data = data.sem),
+  lmer(Marginal_R2 ~ Compete*Fric + RGR_mean  + (1 | trait), na.action = na.omit, data = data.sem))
+# summary(sem_fit_full2, standardized = TRUE, fit.measures = TRUE, rsquare = TRUE)
+# Run summary
+# (sem.sum2 <- summary(sem_fit_full2))
+# sem.sum2$coefficients
+plot(sem_fit_full2, node_attrs = list(shape = "rectangle", color = "white", fillcolor = "white"), digits = 2)
+```
+
+## Supplementary
+### Figure S1
+
+```{r,fig.height=8, fig.width=15}
+
+ind_sp_fig <- ggplot(
+  ind_tda_long[ind_tda_long$trait %in% c("LTO", "LA", "SLA", "RTD"), ],
+  aes(x = (values), y = RGR, col = sp_abbr)) +
+  geom_point(alpha = 1, size = 0.5, aes(col = sp_abbr)) +
+  facet_grid(Compete ~ trait, labeller = labeller(Compete = c("alone" = "Competition-free", "inter" = "Competition")),scale="free") +
+  stat_ellipse(aes(group = sp_abbr, fill = sp_abbr),
+    geom = "polygon", alpha = 0.5, color = NA, level = 0.9) +
+  geom_smooth(method = "lm", se = F, alpha = 1, size = 1, aes(col = sp_abbr)) +
+  labs(title = "", x = "Trait values", y = "Relative growth rate (RGR)") +
+  stat_poly_eq(method = "lm",
+    aes(label = paste(after_stat(rr.label), after_stat(p.value.label), sep = "*\", \"*")), size = 3) +
+  theme_Publication(base_size = 14) +
+  scale_fill_Publication() +
+  scale_colour_Publication()+theme(legend.title = element_blank())
+ind_sp_fig
+ggsave(ind_sp_fig, file="02_output_results/figs/Fig.S9.pdf", height = 8, width = 10)
+```
+
+## Figure 1. Growth rate with year
+```{r,fig.width=8,fig.height=4}
+library(patchwork)
+indtraits_tda$sp_abbr <- factor(indtraits_tda$sp_abbr, levels = sp_abbr)
+
+# Plot for species-specific result
+fig_sp_growth_year <- ggplot(indtraits_tda, aes(x = sp_abbr, y = RGR, fill = sp_abbr)) +
+  geom_boxplot(position = position_dodge(width = 0.8), width = 0.7, alpha = 0.8, outlier.shape = NA) + 
+  facet_grid(Compete ~ comp_year, labeller = labeller(Compete = c("alone" = "Competition-free", "inter" = "Competition")),scale="free") +
+  labs(
+    x = "Species",
+    y = "Relative growth rate (RGR)",
+    title = "") +
+  theme_Publication() +
+  scale_fill_Publication() +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 1),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12),
+    legend.position = "none"
+  )
+fig_sp_growth_year
+
+
+library(eoffice)
+topptx(fig_sp_growth_year,filename = "02_output_results/figs/Fig.S10.pptx",height = 6,width = 6)
+
+a=tapply(indtraits_tda$RGR,list(indtraits_tda$sp,indtraits_tda$Compete),mean)
+CV4(a[,1])
+CV4(a[,2])
+(CV4(a[,2])-CV4(a[,1]))/CV4(a[,1])
+```
+
